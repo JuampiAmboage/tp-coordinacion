@@ -2,6 +2,7 @@ import os
 import logging
 import socket
 import signal
+import uuid
 import multiprocessing
 import message_handler
 from common import middleware, message_protocol
@@ -111,7 +112,8 @@ def main():
                         client_socket, _ = server_socket.accept()
 
                         logging.info("A new client has connected")
-                        message_handler_instance = message_handler.MessageHandler()
+                        client_id = str(uuid.uuid4())
+                        message_handler_instance = message_handler.MessageHandler(client_id)
                         client_list.append([message_handler_instance, client_socket])
                         processes_pool.apply_async(
                             handle_client_request,
