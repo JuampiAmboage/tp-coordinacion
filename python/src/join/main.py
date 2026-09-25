@@ -1,7 +1,7 @@
 import os
 import logging
 
-from common import middleware, message_protocol, fruit_item
+from common import middleware
 
 MOM_HOST = os.environ["MOM_HOST"]
 INPUT_QUEUE = os.environ["INPUT_QUEUE"]
@@ -25,8 +25,7 @@ class JoinFilter:
 
     def process_messsage(self, message, ack, nack):
         logging.info("Received top")
-        fruit_top = message_protocol.internal.deserialize(message)
-        self.output_queue.send(message_protocol.internal.serialize(fruit_top))
+        self.output_queue.send(message)
         ack()
 
     def start(self):
