@@ -43,7 +43,9 @@ sequenceDiagram
     Note over S0: un solo mapa global:<br/>amount_by_fruit["manzana"] = 5 + 10 = 15<br/>(A y B ya quedaron indistinguibles)
 ```
 
-**Solución:** pendiente — incremento 2 (envelope con `client_id`).
+**Solución:** el protocolo interno (`common/message_protocol/internal.py`) pasó a ser un *envelope* `{client_id, type, payload}` (para `MsgType.DATA` y `MsgType.EOF`), en vez de una lista `(fruta, cantidad)` a secas. El `gateway` genera un `client_id` (`uuid.uuid4()`) por cada conexión aceptada y se lo pasa al `MessageHandler` de esa conexión, que lo mete en todo mensaje que arma. `sum` y `aggregation` dejaron de tener un único estado global: pasaron a `amount_by_fruit_by_client` y `fruit_top_by_client` respectivamente (dict de `client_id` → estado), así que dos clientes concurrentes ya no comparten acumulador, sino que cada uno arma y flushea el suyo de forma independiente, sin pisarse. 
+
+Validado contra el escenario 2 (`make switch` → 2 → `make test`): tres clientes concurrentes, una sola réplica de cada control y cada cliente recibe su propio top, sin mezcla.
 
 ### El EOF de un cliente no llegaba a todas las réplicas de Sum
 
@@ -75,8 +77,6 @@ flowchart LR
     S0 -->|manzana: 15 duplicado| A1[aggregation_1]
 ```
 
-**Solución:** pendiente — incremento 3 (particionado por hash de fruta sobre el exchange `direct` ya implementado).
-
 ### Sin barrera de fin de ingesta en Aggregation
 
 `aggregation/main.py` calculaba y emitía su top parcial apenas recibía el primer mensaje de EOF, sin contar que, con `SUM_AMOUNT` instancias de Sum enviándole datos, tendría que haber recibido un EOF de cada una antes de saber que ya tiene el total definitivo de sus frutas.
@@ -92,8 +92,6 @@ sequenceDiagram
     Note over A0: cierra y emite el top<br/>con lo que tiene hasta acá
     S1--xA0: (nunca llegó a mandar nada,<br/>ver problema del EOF de Sum)
 ```
-
-**Solución:** pendiente — incremento 3 (contador de `SUM_AMOUNT` EOFs recibidos antes de cerrar el top parcial).
 
 ### Sin combinación real en Join
 
@@ -111,8 +109,6 @@ sequenceDiagram
     Note over J: no esperó el top de aggregation_1
 ```
 
-**Solución:** pendiente — incremento 4 (contador de `AGGREGATION_AMOUNT` EOFs + merge de los tops parciales en uno final).
-
 ### El gateway no podía enrutar resultados a su cliente de origen
 
 `message_handler.py` no tenía ninguna noción de a qué cliente pertenecía un mensaje de resultado; simplemente lo ofrecía al primer cliente conectado que no descartara el mensaje.
@@ -128,11 +124,10 @@ sequenceDiagram
     Note over B: cliente B recibe un resultado<br/>que ni siquiera es el suyo
 ```
 
-**Solución:** pendiente — incremento 2 (matching de `client_id` en `message_handler.py`).
+**Solución:** `MessageHandler` ahora guarda el `client_id` de su conexión (recibido al construirse) y `deserialize_result_message` sólo devuelve el payload si el `client_id` del mensaje coincide con el propio; si no, devuelve `None` para que el loop de `handle_client_response` siga probando con el resto de los clientes conectados. Esto reemplaza el "se lo doy al primero que no tire error" por un enrutamiento real por identidad.
+
+Validado junto con el ítem anterior contra el escenario 2: cada uno de los tres clientes recibe únicamente su propio resultado.
 
 ### Sin manejo de señales en los controles internos
 
 `sum`, `aggregation` y `join` no capturaban SIGTERM (sólo lo hacían `client` y `gateway`). Si en medio de esta corrida se ejecutaba `make down`, `sum_1` —que todavía tenía `(banana, 3)` de A sin flushear— era terminado abruptamente al vencer el plazo de gracia, sin poder cerrar la conexión al middleware de forma ordenada.
-
-**Solución:** pendiente — incremento 5 (manejo de SIGTERM en Sum, Aggregation y Join, análogo al que ya usan `client` y `gateway`).
-
