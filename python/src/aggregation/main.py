@@ -23,20 +23,39 @@ class AggregationFilter:
         self.output_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, OUTPUT_QUEUE
         )
-        self.fruit_top_by_client = {}
+        self.state_by_client = {}
+
+    def _client_state(self, client_id):
+        return self.state_by_client.setdefault(
+            client_id, {"fruit_top": [], "eofs_received": 0}
+        )
 
     def _process_data(self, client_id, fruit, amount):
         logging.info("Processing data message")
-        fruit_top = self.fruit_top_by_client.setdefault(client_id, [])
+        fruit_top = self._client_state(client_id)["fruit_top"]
         for i in range(len(fruit_top)):
             if fruit_top[i].fruit == fruit:
-                fruit_top[i] = fruit_top[i] + fruit_item.FruitItem(fruit, amount)
+                # Can't just reassign fruit_top[i]: with more than one sum
+                # replica, the same fruit arrives more than once (one partial
+                # total per replica) and its new amount may no longer belong
+                # at index i, so it has to be pulled out and re-inserted.
+                updated_fruit_item = fruit_top[i] + fruit_item.FruitItem(fruit, amount)
+                del fruit_top[i]
+                bisect.insort(fruit_top, updated_fruit_item)
                 return
         bisect.insort(fruit_top, fruit_item.FruitItem(fruit, amount))
 
     def _process_eof(self, client_id):
-        logging.info("Received EOF")
-        fruit_top = self.fruit_top_by_client.pop(client_id, [])
+        client_state = self._client_state(client_id)
+        client_state["eofs_received"] += 1
+        # Every sum replica sends its own EOF for this client (see
+        # sum/main.py's control broadcast): only once all of them checked in
+        # do we know no more data for this client's fruits is coming.
+        if client_state["eofs_received"] < SUM_AMOUNT:
+            return
+
+        logging.info("Received EOF from every sum replica")
+        fruit_top = self.state_by_client.pop(client_id)["fruit_top"]
         fruit_chunk = list(fruit_top[-TOP_SIZE:])
         fruit_chunk.reverse()
         payload = list(

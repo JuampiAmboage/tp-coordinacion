@@ -19,9 +19,6 @@ Tras la lectura de la consigna y la revisión del código base, se identificaron
   - **Con keys** (tipo `direct`): cada instancia se bindea a su propia clave (p. ej. `aggregation_0`), lo que habilita mandarle un mensaje a una única instancia puntual en vez de a todas.
   - **Sin keys** (tipo `fanout`): cada instancia que se conecta arma su propia cola anónima y exclusiva bindeada al exchange, así que todas reciben una copia de lo publicado sin que el publisher necesite saber cuántas son, esta es la base para resolver "El EOF de un cliente no llegaba a todas las réplicas de Sum", justamente porque el `gateway` no tiene forma de conocer `SUM_AMOUNT`.
 
-
-Esto se validó contra el escenario 1 (`make switch` → 1 → `make test`): un cliente, una sola réplica de cada control, el transporte funciona de punta a punta.
-
 ### Sin aislamiento por cliente
 
 El protocolo interno serializaba únicamente `(fruta, cantidad)`, sin ningún identificador de cliente. `sum`, `aggregation` y `join` acumulan en una única estructura de estado global (`amount_by_fruit`, `fruit_top`), compartida por todas las conexiones activas.
@@ -45,7 +42,6 @@ sequenceDiagram
 
 **Solución:** el protocolo interno (`common/message_protocol/internal.py`) pasó a ser un *envelope* `{client_id, type, payload}` (para `MsgType.DATA` y `MsgType.EOF`), en vez de una lista `(fruta, cantidad)` a secas. El `gateway` genera un `client_id` (`uuid.uuid4()`) por cada conexión aceptada y se lo pasa al `MessageHandler` de esa conexión, que lo mete en todo mensaje que arma. `sum` y `aggregation` dejaron de tener un único estado global: pasaron a `amount_by_fruit_by_client` y `fruit_top_by_client` respectivamente (dict de `client_id` → estado), así que dos clientes concurrentes ya no comparten acumulador, sino que cada uno arma y flushea el suyo de forma independiente, sin pisarse. 
 
-Validado contra el escenario 2 (`make switch` → 2 → `make test`): tres clientes concurrentes, una sola réplica de cada control y cada cliente recibe su propio top, sin mezcla.
 
 ### El EOF de un cliente no llegaba a todas las réplicas de Sum
 
@@ -65,7 +61,30 @@ sequenceDiagram
     Note over S1: sum_1 nunca recibe este EOF:<br/>(banana, 3) de A queda huérfano
 ```
 
-**Solución:** pendiente — incremento 3 (fan-out del EOF Gateway→Sum sobre el exchange `fanout` ya implementado).
+**Solución:** el primer intento fue que el `gateway` publique el EOF directo al exchange `fanout` (`SUM_CONTROL_EXCHANGE`), igual que ya hacíamos para los datos con `INPUT_QUEUE`. Al probarlo contra el escenario 3 (`SUM_AMOUNT=3`) rompió, pero no por desorden: los valores venían mal. La causa: el `fanout` no tiene backlog y entrega casi instantáneo a las 3 réplicas, mientras que `INPUT_QUEUE` sí tiene uno real (300 registros, 3 consumidores con `prefetch=1`). El EOF le termina ganando la carrera al grueso de los datos, no sólo al último mensaje.
+
+```mermaid
+sequenceDiagram
+    participant GW as Gateway
+    participant Q as INPUT_QUEUE
+    participant FO as SUM_CONTROL_EXCHANGE (fanout)
+    participant S0 as sum_0
+    participant S1 as sum_1
+    participant S2 as sum_2
+
+    Note over Q: 300 registros en cola,<br/>3 consumidores compitiendo
+    GW->>FO: publish EOF (cliente A) — sin backlog, casi instantáneo
+    FO-->>S0: EOF
+    FO-->>S1: EOF
+    FO-->>S2: EOF
+    Note over S0,S2: flushean YA, con lo poco que<br/>alcanzaron a sacar de la cola
+    Q--xS0: el resto del backlog de A<br/>llega después del flush: se pierde
+```
+
+La solución final invierte el orden: el EOF vuelve a viajar por `INPUT_QUEUE` (misma conexión que los datos de ese cliente, preservando FIFO), y **sólo la réplica de Sum que lo desencola** (una sola, al ser cola en competencia) lo reenvía al exchange `fanout`. Ahora ninguna réplica flushea directo al leer el EOF de `INPUT_QUEUE`: todas, incluida la que reenvía, disparan su propio flush recién al recibirlo por el canal de control. Por FIFO de una única cola, para cuando ese EOF llega a la cabeza y se despacha, los registros de ese cliente que estaban delante ya fueron como mínimo despachados a alguna réplica.
+
+De paso, este cambio destapó una violación de *thread-safety*: usar el mismo exchange de control tanto para consumir (`control_thread`) como para publicar el *relay* (`data_thread`) comparte un canal de `pika.BlockingConnection` entre hilos, que no lo soporta. Se resolvió con dos instancias separadas (`control_exchange` para consumir, `control_exchange_relay` para publicar), cada una con su propia conexión.
+
 
 ### Sin partición de datos entre réplicas de Aggregation
 
@@ -76,6 +95,8 @@ flowchart LR
     S0[sum_0] -->|manzana: 15| A0[aggregation_0]
     S0 -->|manzana: 15 duplicado| A1[aggregation_1]
 ```
+
+**Solución:** `sum/main.py` calcula un hash determinístico de la fruta (`hashlib.md5`, no el `hash()` nativo de Python ya que ese está *seedeado* al azar por proceso, así que dos réplicas de Sum podrían mandar la misma fruta a exchanges distintos) módulo `AGGREGATION_AMOUNT`, y manda cada fruta **sólo** al exchange de esa instancia puntual. El broadcast de EOF hacia Aggregation no se tocó, sigue siendo intencional (todas necesitan enterarse de que esta réplica de Sum terminó).
 
 ### Sin barrera de fin de ingesta en Aggregation
 
@@ -92,6 +113,21 @@ sequenceDiagram
     Note over A0: cierra y emite el top<br/>con lo que tiene hasta acá
     S1--xA0: (nunca llegó a mandar nada,<br/>ver problema del EOF de Sum)
 ```
+
+**Solución:** `aggregation/main.py` cuenta `eofs_received` por cliente y sólo calcula y emite el top cuando llega a `SUM_AMOUNT`. Pero esto expuso otro bug heredado del esqueleto: como ahora una misma fruta puede llegar en más de un mensaje (un total parcial por cada réplica de Sum que la tenía), `_process_data` reasignaba el monto actualizado en el mismo índice de la lista ordenada (`fruit_top[i] = ...`) sin volver a ordenar. Con una sola réplica de Sum esto nunca pasaba, porque Aggregation recibía cada fruta una única vez, ya sumada.
+
+`fruit_top` se mantiene siempre ordenada ascendente por cantidad (por `FruitItem.__lt__`). Con `fruit_top = [banana:5, pera:20, manzana:30]`, si llega `("banana", 50)` de otra réplica de Sum, el código original hacía `fruit_top[0] = banana:55`, dejando la lista `[banana:55, pera:20, manzana:30]`, desordenada (banana ya no es la más chica, pero se quedó en el índice del que sí lo era). `_process_eof` toma `fruit_top[-TOP_SIZE:]` asumiendo orden ascendente, así que con `TOP_SIZE=2` tomaría `[pera:20, manzana:30]`, dejando afuera a banana, que en realidad pasó a ser la mayor.
+
+El fix saca el elemento viejo y deja que `bisect.insort` (búsqueda binaria sobre una lista ya ordenada) encuentre su posición correcta, en vez de reasignar en el lugar:
+
+```
+fruit_top:                      [banana:5, pera:20, manzana:30]
+del fruit_top[0]:                [pera:20, manzana:30]
+bisect.insort(..., banana:55):   [pera:20, manzana:30, banana:55]
+```
+
+Ahora `fruit_top[-2:]` sí toma correctamente `[manzana:30, banana:55]` — el top real.
+
 
 ### Sin combinación real en Join
 
