@@ -1,7 +1,8 @@
 import os
 import logging
+import bisect
 
-from common import middleware
+from common import middleware, message_protocol, fruit_item
 
 MOM_HOST = os.environ["MOM_HOST"]
 INPUT_QUEUE = os.environ["INPUT_QUEUE"]
@@ -22,11 +23,41 @@ class JoinFilter:
         self.output_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, OUTPUT_QUEUE
         )
+        self.state_by_client = {}
 
     def process_messsage(self, message, ack, nack):
-        logging.info("Received top")
-        self.output_queue.send(message)
+        logging.info("Received partial top")
+        client_id, _msg_type, payload = message_protocol.internal.deserialize(message)
+        client_state = self.state_by_client.setdefault(
+            client_id, {"candidates": [], "partials_received": 0}
+        )
+        # Sum already partitions by fruit, so no fruit can show up in more
+        # than one aggregation instance's partial top: a plain insort is
+        # enough here
+        for fruit, amount in payload:
+            bisect.insort(
+                client_state["candidates"], fruit_item.FruitItem(fruit, amount)
+            )
+        client_state["partials_received"] += 1
+
+        # Each aggregation instance sends exactly one partial top per client
+        # (its own SUM_AMOUNT barrier), never a separate EOF here 
+        if client_state["partials_received"] == AGGREGATION_AMOUNT:
+            self._send_final_top(client_id)
+
         ack()
+
+    def _send_final_top(self, client_id):
+        logging.info("Merged partial tops from every aggregation instance")
+        candidates = self.state_by_client.pop(client_id)["candidates"]
+        top_chunk = list(candidates[-TOP_SIZE:])
+        top_chunk.reverse()
+        payload = [(item.fruit, item.amount) for item in top_chunk]
+        self.output_queue.send(
+            message_protocol.internal.serialize(
+                client_id, message_protocol.internal.MsgType.DATA, payload
+            )
+        )
 
     def start(self):
         self.input_queue.start_consuming(self.process_messsage)

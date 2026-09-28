@@ -145,6 +145,10 @@ sequenceDiagram
     Note over J: no esperó el top de aggregation_1
 ```
 
+**Solución:** a diferencia de Sum→Aggregation, acá `aggregation/main.py` nunca manda un EOF aparte, ya que cada instancia manda un único mensaje `DATA` con su top parcial cuando cierra su propia barrera de `SUM_AMOUNT`. Así que la barrera de Join no cuenta EOFs, cuenta cuántos tops parciales recibió por cliente: junta los candidatos de cada uno en una lista ordenada, y recién al recibir el `AGGREGATION_AMOUNT`-ésimo arma el top final (los últimos `TOP_SIZE` de esa lista) y lo manda al `gateway`.
+
+Como el particionado por hash de Sum garantiza que una fruta nunca aparece en el top parcial de más de una instancia de Aggregation, acá alcanza con `bisect.insort` liso y llano a diferencia de `_process_data` en Aggregation, nunca hace falta buscar y reemplazar una fruta repetida. 
+
 ### El gateway no podía enrutar resultados a su cliente de origen
 
 `message_handler.py` no tenía ninguna noción de a qué cliente pertenecía un mensaje de resultado; simplemente lo ofrecía al primer cliente conectado que no descartara el mensaje.
