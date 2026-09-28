@@ -42,7 +42,6 @@ sequenceDiagram
 
 **Solución:** el protocolo interno (`common/message_protocol/internal.py`) pasó a ser un *envelope* `{client_id, type, payload}` (para `MsgType.DATA` y `MsgType.EOF`), en vez de una lista `(fruta, cantidad)` a secas. El `gateway` genera un `client_id` (`uuid.uuid4()`) por cada conexión aceptada y se lo pasa al `MessageHandler` de esa conexión, que lo mete en todo mensaje que arma. `sum` y `aggregation` dejaron de tener un único estado global: pasaron a `amount_by_fruit_by_client` y `fruit_top_by_client` respectivamente (dict de `client_id` → estado), así que dos clientes concurrentes ya no comparten acumulador, sino que cada uno arma y flushea el suyo de forma independiente, sin pisarse. 
 
-
 ### El EOF de un cliente no llegaba a todas las réplicas de Sum
 
 El `gateway` publicaba el aviso de fin de ingesta en la misma cola de trabajo (`INPUT_QUEUE`) que los datos. Como `sum_0` y `sum_1` son consumidores en competencia de esa cola, ese único mensaje lo recibía sólo uno de los dos; el otro nunca se enteraba de que el cliente había terminado y lo que tenga acumulado para ese cliente no se llegaba a enviar. La constante `SUM_CONTROL_EXCHANGE`, declarada pero no usada en `sum/main.py`, era indicio de que el esqueleto anticipaba un canal de control separado para esto.
@@ -85,7 +84,6 @@ La solución final invierte el orden: el EOF vuelve a viajar por `INPUT_QUEUE` (
 
 De paso, este cambio destapó una violación de *thread-safety*: usar el mismo exchange de control tanto para consumir (`control_thread`) como para publicar el *relay* (`data_thread`) comparte un canal de `pika.BlockingConnection` entre hilos, que no lo soporta. Se resolvió con dos instancias separadas (`control_exchange` para consumir, `control_exchange_relay` para publicar), cada una con su propia conexión.
 
-
 ### Sin partición de datos entre réplicas de Aggregation
 
 En `sum/main.py`, `_process_eof` reenviaba cada fruta a **todas** las instancias de Aggregation (loop anidado sobre `data_output_exchanges`), en lugar de a una sola. Esto multiplicaba por `AGGREGATION_AMOUNT` tanto el tráfico entre controles como el cómputo, porque cada Aggregation vuelvía a sumar y ordenar datos que ya había procesado la otra, violando el requisito de minimizar redundancia.
@@ -127,7 +125,6 @@ bisect.insort(..., banana:55):   [pera:20, manzana:30, banana:55]
 ```
 
 Ahora `fruit_top[-2:]` sí toma correctamente `[manzana:30, banana:55]` — el top real.
-
 
 ### Sin combinación real en Join
 
@@ -176,3 +173,15 @@ Validado junto con el ítem anterior contra el escenario 2: cada uno de los tres
 
 `sum` es el caso particular: corre dos hilos (cola de datos + exchange de control), y Python siempre entrega las señales al hilo principal (que no es el que está bloqueado en ninguno de los dos `start_consuming()`). Esto expuso que `stop_consuming()` en el middleware no era seguro de invocar desde otro hilo: llamaba a `channel.stop_consuming()` directo, y `pika.BlockingConnection` no tolera que otro hilo toque su canal. Se corrigió una sola vez en `middleware_rabbitmq.py`, usando `channel.connection.add_callback_threadsafe(channel.stop_consuming)`, que agenda la detención en el hilo dueño de esa conexión en lugar de tocarla directamente.
 
+## Resumen final
+
+### Clientes
+
+Cada conexión de cliente obtiene un `client_id` propio (`uuid.uuid4()`, generado en el `gateway`) que viaja pegado a todo mensaje interno. Gracias a eso, ningún control necesita un cliente "activo" a la vez: `sum`, `aggregation` y `join` guardan su estado en diccionarios indexados por `client_id` (`amount_by_fruit_by_client`, `state_by_client`), así que atienden a tantos clientes concurrentes como lleguen, cada uno con su propio acumulador aislado, sin coordinación adicional entre ellos ni necesidad de sumar controles para admitir más clientes. El único límite es el de memoria/CPU disponible en cada réplica. Del lado del `gateway`, cada conexión corre en su propio proceso (`multiprocessing.Pool`), así que un cliente lento o caído no bloquea a los demás.
+
+### Volumen de datos de un mismo cliente
+
+Dentro del flujo de un único cliente, el trabajo se reparte en dos puntos:
+
+- **Gateway → Sum**: `INPUT_QUEUE` es una cola de trabajo con consumidores en competencia — cuantas más réplicas de `sum` (`SUM_AMOUNT`) haya configuradas, más se reparte el volumen de `FRUIT_RECORD` de ese cliente entre ellas.
+- **Sum → Aggregation**: el particionado por hash de fruta reparte tanto el tráfico como el cómputo de ordenamiento/top-K entre las `AGGREGATION_AMOUNT` instancias — al ser un hash (`md5`) y no depender del contenido semántico de las frutas, la distribución de carga entre instancias es pareja independientemente de qué frutas predominen en el dataset.
