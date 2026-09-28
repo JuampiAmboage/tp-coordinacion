@@ -171,3 +171,8 @@ Validado junto con el ítem anterior contra el escenario 2: cada uno de los tres
 ### Sin manejo de señales en los controles internos
 
 `sum`, `aggregation` y `join` no capturaban SIGTERM (sólo lo hacían `client` y `gateway`). Si en medio de esta corrida se ejecutaba `make down`, `sum_1` —que todavía tenía `(banana, 3)` de A sin flushear— era terminado abruptamente al vencer el plazo de gracia, sin poder cerrar la conexión al middleware de forma ordenada.
+
+**Solución:** los tres registran un manejador de `SIGTERM` (mismo patrón que ya usaban `client` y `gateway`) que llama a `stop_consuming()` sobre su(s) cola(s)/exchange(s) de entrada; una vez que `start_consuming()` retorna, cierran sus conexiones y el proceso termina con código 0.
+
+`sum` es el caso particular: corre dos hilos (cola de datos + exchange de control), y Python siempre entrega las señales al hilo principal (que no es el que está bloqueado en ninguno de los dos `start_consuming()`). Esto expuso que `stop_consuming()` en el middleware no era seguro de invocar desde otro hilo: llamaba a `channel.stop_consuming()` directo, y `pika.BlockingConnection` no tolera que otro hilo toque su canal. Se corrigió una sola vez en `middleware_rabbitmq.py`, usando `channel.connection.add_callback_threadsafe(channel.stop_consuming)`, que agenda la detención en el hilo dueño de esa conexión en lugar de tocarla directamente.
+

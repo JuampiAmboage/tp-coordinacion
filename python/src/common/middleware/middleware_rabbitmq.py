@@ -33,11 +33,14 @@ def _consume(channel, queue_name, on_message_callback):
 
 
 def _stop_consuming(channel):
-    # BlockingConnection is not thread-safe: this must run on the same
-    # thread that is blocked in start_consuming(), so callers invoking it
-    # from another thread need channel.connection.add_callback_threadsafe.
+    # BlockingConnection isn't thread-safe, so this can't just call
+    # channel.stop_consuming() directly if the caller isn't the thread
+    # blocked in start_consuming() (e.g. a SIGTERM handler, which Python
+    # always runs on the main thread). add_callback_threadsafe schedules the
+    # actual stop on that connection's own thread, making this safe to call
+    # from anywhere.
     try:
-        channel.stop_consuming()
+        channel.connection.add_callback_threadsafe(channel.stop_consuming)
     except pika.exceptions.AMQPConnectionError as e:
         raise MessageMiddlewareDisconnectedError(str(e)) from e
 

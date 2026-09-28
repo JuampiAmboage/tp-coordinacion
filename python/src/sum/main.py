@@ -1,5 +1,6 @@
 import os
 import logging
+import signal
 import threading
 import hashlib
 
@@ -48,6 +49,12 @@ class SumFilter:
         # amount_by_fruit_by_client is written from the data-queue thread and
         # read/popped from the control-exchange thread, see start().
         self.lock = threading.Lock()
+        signal.signal(signal.SIGTERM, self._handle_sigterm)
+
+    def _handle_sigterm(self, signum, frame):
+        logging.info("Received SIGTERM signal")
+        self.input_queue.stop_consuming()
+        self.control_exchange.stop_consuming()
 
     def _process_data(self, client_id, fruit, amount):
         logging.info(f"Process data")
@@ -116,6 +123,12 @@ class SumFilter:
         control_thread.start()
         data_thread.join()
         control_thread.join()
+
+        self.input_queue.close()
+        self.control_exchange.close()
+        self.control_exchange_relay.close()
+        for data_output_exchange in self.data_output_exchanges:
+            data_output_exchange.close()
 
 def main():
     logging.basicConfig(level=logging.INFO)

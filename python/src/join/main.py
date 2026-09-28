@@ -1,5 +1,6 @@
 import os
 import logging
+import signal
 import bisect
 
 from common import middleware, message_protocol, fruit_item
@@ -24,6 +25,11 @@ class JoinFilter:
             MOM_HOST, OUTPUT_QUEUE
         )
         self.state_by_client = {}
+        signal.signal(signal.SIGTERM, self._handle_sigterm)
+
+    def _handle_sigterm(self, signum, frame):
+        logging.info("Received SIGTERM signal")
+        self.input_queue.stop_consuming()
 
     def process_messsage(self, message, ack, nack):
         logging.info("Received partial top")
@@ -61,6 +67,8 @@ class JoinFilter:
 
     def start(self):
         self.input_queue.start_consuming(self.process_messsage)
+        self.input_queue.close()
+        self.output_queue.close()
 
 
 def main():

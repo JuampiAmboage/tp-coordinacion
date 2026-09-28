@@ -1,5 +1,6 @@
 import os
 import logging
+import signal
 import bisect
 
 from common import middleware, message_protocol, fruit_item
@@ -24,6 +25,11 @@ class AggregationFilter:
             MOM_HOST, OUTPUT_QUEUE
         )
         self.state_by_client = {}
+        signal.signal(signal.SIGTERM, self._handle_sigterm)
+
+    def _handle_sigterm(self, signum, frame):
+        logging.info("Received SIGTERM signal")
+        self.input_exchange.stop_consuming()
 
     def _client_state(self, client_id):
         return self.state_by_client.setdefault(
@@ -82,6 +88,8 @@ class AggregationFilter:
 
     def start(self):
         self.input_exchange.start_consuming(self.process_messsage)
+        self.input_exchange.close()
+        self.output_queue.close()
 
 
 def main():
